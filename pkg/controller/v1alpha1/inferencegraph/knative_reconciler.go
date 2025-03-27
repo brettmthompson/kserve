@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 
 	v1alpha1api "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
@@ -135,10 +136,10 @@ func semanticEquals(desiredService, service *knservingv1.Service) bool {
 		equality.Semantic.DeepEqual(desiredService.Spec.RouteSpec, service.Spec.RouteSpec)
 }
 
-func createKnativeService(componentMeta metav1.ObjectMeta, graph *v1alpha1api.InferenceGraph, config *RouterConfig) *knservingv1.Service {
+func createKnativeService(client client.Client, componentMeta metav1.ObjectMeta, graph *v1alpha1api.InferenceGraph, config *RouterConfig) (*knservingv1.Service, error) {
 	bytes, err := json.Marshal(graph.Spec)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	annotations := componentMeta.GetAnnotations()
 	if annotations == nil {
@@ -148,30 +149,10 @@ func createKnativeService(componentMeta metav1.ObjectMeta, graph *v1alpha1api.In
 	if labels == nil {
 		labels = make(map[string]string) //nolint:ineffassign, staticcheck
 	}
-	// User can pass down scaling class annotation to overwrite the default scaling KPA
-	if _, ok := annotations[autoscaling.ClassAnnotationKey]; !ok {
-		annotations[autoscaling.ClassAnnotationKey] = autoscaling.KPA
-	}
 
-	if _, ok := annotations[autoscaling.MinScaleAnnotationKey]; !ok {
-		if graph.Spec.MinReplicas == nil {
-			annotations[autoscaling.MinScaleAnnotationKey] = fmt.Sprint(constants.DefaultMinReplicas)
-		} else {
-			annotations[autoscaling.MinScaleAnnotationKey] = fmt.Sprint(*graph.Spec.MinReplicas)
-		}
-	}
-
-	// The larger of min-scale and initial-scale is chosen as the initial target scale for a knative Revision.
-	// When min-scale is 0, set initial-scale to 0 so the created knative revision has an initial target scale of 0.
-	// Configuring scaling for knative: https://knative.dev/docs/serving/autoscaling/scale-bounds/#initial-scale
-	if annotations[autoscaling.MinScaleAnnotationKey] == "0" {
-		annotations[autoscaling.InitialScaleAnnotationKey] = "0"
-	}
-
-	if _, ok := annotations[autoscaling.MaxScaleAnnotationKey]; !ok {
-		if graph.Spec.MaxReplicas != 0 {
-			annotations[autoscaling.MaxScaleAnnotationKey] = fmt.Sprint(graph.Spec.MaxReplicas)
-		}
+	err = setAutoScalingAnnotations(client, annotations, graph)
+	if err != nil {
+		return nil, err
 	}
 
 	// ksvc metadata.annotations
@@ -265,7 +246,7 @@ func createKnativeService(componentMeta metav1.ObjectMeta, graph *v1alpha1api.In
 
 		service.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Env = append(service.Spec.ConfigurationSpec.Template.Spec.PodSpec.Containers[0].Env, propagateEnv)
 	}
-	return service
+	return service, nil
 }
 
 func constructResourceRequirements(graph v1alpha1api.InferenceGraph, config RouterConfig) v1.ResourceRequirements {
@@ -289,4 +270,116 @@ func constructResourceRequirements(graph v1alpha1api.InferenceGraph, config Rout
 		}
 	}
 	return specResources
+}
+
+// setAutoScalingAnnotations checks the knative autoscaler configuration defined in the config-autoscaler
+// configmap in the knative-serving namespace and compares the values to the autoscaling configuration requested
+// for the IG. It then sets the necessary annotations for the desired autoscaling configuration.
+func setAutoScalingAnnotations(client client.Client,
+	annotations map[string]string,
+	graph *v1alpha1api.InferenceGraph) error {
+
+	// If a minReplicas value is not set for the IG, then use the default min-scale value of 1.
+	var revisionMinScale int
+	if _, ok := annotations[autoscaling.MinScaleAnnotationKey]; !ok {
+		if graph.Spec.MinReplicas == nil {
+			annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(constants.DefaultMinReplicas)
+			revisionMinScale = constants.DefaultMinReplicas
+		} else {
+			annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(*graph.Spec.MinReplicas)
+			revisionMinScale = *graph.Spec.MinReplicas
+		}
+	} else {
+		log.Info("inference graph contains min-scale annotation. This value will be used instead of the configured minReplicas",
+			"min-replicas", annotations[autoscaling.MinScaleAnnotationKey])
+		minScaleInt, err := strconv.Atoi(annotations[autoscaling.MinScaleAnnotationKey])
+		if err != nil {
+			return errors.Wrapf(err, "failed to convert existing min-scale annotation to an integer")
+		}
+		revisionMinScale = minScaleInt
+	}
+
+	var revisionMaxScale int
+	if _, ok := annotations[autoscaling.MaxScaleAnnotationKey]; !ok {
+		annotations[constants.MaxScaleAnnotationKey] = fmt.Sprint(graph.Spec.MaxReplicas)
+		revisionMaxScale = graph.Spec.MaxReplicas
+	} else {
+		log.Info("inference graph contains max-scale annotation. This value will be used instead of the configured maxReplicas",
+			"max-scale", annotations[autoscaling.MaxScaleAnnotationKey])
+		maxScaleInt, err := strconv.Atoi(annotations[autoscaling.MaxScaleAnnotationKey])
+		if err != nil {
+			return errors.Wrapf(err, "failed to convert existing max-scale annotation to an integer")
+		}
+		revisionMaxScale = maxScaleInt
+	}
+
+	// User can pass down scaling class annotation to overwrite the default scaling KPA
+	if _, ok := annotations[autoscaling.ClassAnnotationKey]; !ok {
+		annotations[autoscaling.ClassAnnotationKey] = autoscaling.KPA
+	}
+
+	if graph.Spec.ScaleTarget != nil {
+		annotations[autoscaling.TargetAnnotationKey] = fmt.Sprint(*graph.Spec.ScaleTarget)
+	}
+
+	if graph.Spec.ScaleMetric != nil {
+		annotations[autoscaling.MetricAnnotationKey] = fmt.Sprint(*graph.Spec.ScaleMetric)
+	}
+
+	// Retrive the allow-zero-initial-scale and initial-scale values from the config-autoscaler configmap.
+	// If their respective keys, are not found in the configmap, use the knative default values.
+	allowZeroInitialScale := "false"
+	globalInitialScale := "1"
+	autoscalerConfig := &v1.ConfigMap{}
+	err := client.Get(context.TODO(), types.NamespacedName{Name: "config-autoscaler", Namespace: "knative-serving"}, autoscalerConfig)
+	if err != nil {
+		return errors.Wrapf(err, "failed to retrieve config-autoscaler configmap from the knative-serving namespace during knative service creation.")
+	}
+	if autoscalerConfig.Data != nil {
+		if configuredAllowZeroInitialScale, ok := autoscalerConfig.Data["allow-zero-initial-scale"]; ok {
+			allowZeroInitialScale = configuredAllowZeroInitialScale
+		}
+		if configuredInitialScale, ok := autoscalerConfig.Data["initial-scale"]; ok {
+			globalInitialScale = configuredInitialScale
+		}
+	}
+
+	initialScaleInt, err := strconv.Atoi(globalInitialScale)
+	if err != nil {
+		return errors.Wrapf(err, fmt.Sprintf("failed to convert configured knative global initial-scale value to an integer. initial-scale: %s", globalInitialScale))
+	}
+
+	// Provide transparency to users while aligning with knatives expected behaviour, log a warning when the knative global
+	// initial-scale value exceeds the requested minScale value for the IG.
+	if initialScaleInt > revisionMinScale {
+		log.Info("WARNING: knative is globally configured with an initial-scale value that is greater than the requested min-scale for the IG",
+			"initial-scale", initialScaleInt,
+			"min-scale", revisionMinScale)
+	}
+
+	// knative will choose the larger of min-scale and initial-scale as the initial target scale for a knative Revision.
+	// When min-scale is 0, if allow-zeron-initial scale is true, set initial-scale to 0 for the created knative revision.
+	// This will prevent any pods from being created to initialize a knative revision when an IG has minReplicas set to 0.
+	// Configuring scaling for knative: https://knative.dev/docs/serving/autoscaling/scale-bounds/#initial-scale
+	if revisionMinScale == 0 {
+		if allowZeroInitialScale == "true" {
+			log.Info("kserve will override the global knative configuration for initial-scale on a per revision basis when an IG is requested with min-scale 0",
+				"revision-intitial-scale", "0",
+				"global-initial-scale", globalInitialScale)
+			annotations[constants.InitialScaleAnnotationKey] = "0"
+		} else {
+			log.Info("WARNING: The current knative global configuration does not allow zero initial scale.",
+				"allow-zero-initial-scale", allowZeroInitialScale,
+				"initial-scale", globalInitialScale)
+		}
+	} else if revisionMaxScale != 0 && initialScaleInt > revisionMaxScale {
+		log.Info("WARNING: knative is globally configured with an initial-scale value that is greater than the requested max-scale for the IG",
+			"initial-scale", initialScaleInt,
+			"max-scale", graph.Spec.MaxReplicas)
+		log.Info("setting initial-scale to the same value as max-scale for the requested IG",
+			"initial-scale", graph.Spec.MaxReplicas)
+		annotations[constants.InitialScaleAnnotationKey] = fmt.Sprint(graph.Spec.MaxReplicas)
+	}
+
+	return nil
 }

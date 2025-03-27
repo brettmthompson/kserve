@@ -19,6 +19,7 @@ package knative
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	"github.com/kserve/kserve/pkg/constants"
@@ -62,51 +63,32 @@ func NewKsvcReconciler(client client.Client,
 	componentExt *v1beta1.ComponentExtensionSpec,
 	podSpec *corev1.PodSpec,
 	componentStatus v1beta1.ComponentStatusSpec,
-	disallowedLabelList []string) *KsvcReconciler {
+	disallowedLabelList []string) (*KsvcReconciler, error) {
+	ksvc, err := createKnativeService(client, componentMeta, componentExt, podSpec, componentStatus, disallowedLabelList)
+	if err != nil {
+		log.Error(err, "failed to create knative service", "inference service", componentMeta.Name)
+		return nil, err
+	}
 	return &KsvcReconciler{
 		client:          client,
 		scheme:          scheme,
-		Service:         createKnativeService(componentMeta, componentExt, podSpec, componentStatus, disallowedLabelList),
+		Service:         ksvc,
 		componentExt:    componentExt,
 		componentStatus: componentStatus,
-	}
+	}, nil
 }
 
-func createKnativeService(componentMeta metav1.ObjectMeta,
+func createKnativeService(client client.Client,
+	componentMeta metav1.ObjectMeta,
 	componentExtension *v1beta1.ComponentExtensionSpec,
 	podSpec *corev1.PodSpec,
 	componentStatus v1beta1.ComponentStatusSpec,
-	disallowedLabelList []string) *knservingv1.Service {
+	disallowedLabelList []string) (*knservingv1.Service, error) {
 	annotations := componentMeta.GetAnnotations()
 
-	if componentExtension.MinReplicas == nil {
-		annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(constants.DefaultMinReplicas)
-	} else {
-		annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(*componentExtension.MinReplicas)
-	}
-
-	// The larger of min-scale and initial-scale is chosen as the initial target scale for a knative Revision.
-	// When min-scale is 0, set initial-scale to 0 so the created knative revision has an initial target scale of 0.
-	// Configuring scaling for knative: https://knative.dev/docs/serving/autoscaling/scale-bounds/#initial-scale
-	if annotations[constants.MinScaleAnnotationKey] == "0" {
-		annotations[constants.InitialScaleAnnotationKey] = "0"
-	}
-
-	if componentExtension.MaxReplicas != 0 {
-		annotations[constants.MaxScaleAnnotationKey] = fmt.Sprint(componentExtension.MaxReplicas)
-	}
-
-	// User can pass down scaling class annotation to overwrite the default scaling KPA
-	if _, ok := annotations[autoscaling.ClassAnnotationKey]; !ok {
-		annotations[autoscaling.ClassAnnotationKey] = autoscaling.KPA
-	}
-
-	if componentExtension.ScaleTarget != nil {
-		annotations[autoscaling.TargetAnnotationKey] = fmt.Sprint(*componentExtension.ScaleTarget)
-	}
-
-	if componentExtension.ScaleMetric != nil {
-		annotations[autoscaling.MetricAnnotationKey] = fmt.Sprint(*componentExtension.ScaleMetric)
+	err := setAutoScalingAnnotations(client, annotations, componentExtension)
+	if err != nil {
+		return nil, err
 	}
 
 	// ksvc metadata.annotations
@@ -197,7 +179,7 @@ func createKnativeService(componentMeta metav1.ObjectMeta,
 			},
 		},
 	}
-	return service
+	return service, nil
 }
 
 func reconcileKsvc(desired *knservingv1.Service, existing *knservingv1.Service) error {
@@ -285,4 +267,96 @@ func semanticEquals(desiredService, service *knservingv1.Service) bool {
 	return equality.Semantic.DeepEqual(desiredService.Spec.ConfigurationSpec, service.Spec.ConfigurationSpec) &&
 		equality.Semantic.DeepEqual(desiredService.ObjectMeta.Labels, service.ObjectMeta.Labels) &&
 		equality.Semantic.DeepEqual(desiredService.Spec.RouteSpec, service.Spec.RouteSpec)
+}
+
+// setAutoScalingAnnotations checks the knative autoscaler configuration defined in the config-autoscaler
+// configmap in the knative-serving namespace and compares the values to the autoscaling configuration requested
+// for the ISVC. It then sets the necessary annotations for the desired autoscaling configuration.
+func setAutoScalingAnnotations(client client.Client,
+	annotations map[string]string,
+	componentExtension *v1beta1.ComponentExtensionSpec) error {
+
+	// If a minReplicas value is not set for the ISVC, then use the default min-scale value of 1.
+	var revisionMinScale int
+	if componentExtension.MinReplicas == nil {
+		annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(constants.DefaultMinReplicas)
+		revisionMinScale = constants.DefaultMinReplicas
+	} else {
+		annotations[constants.MinScaleAnnotationKey] = fmt.Sprint(*componentExtension.MinReplicas)
+		revisionMinScale = *componentExtension.MinReplicas
+	}
+
+	annotations[constants.MaxScaleAnnotationKey] = fmt.Sprint(componentExtension.MaxReplicas)
+
+	// User can pass down scaling class annotation to overwrite the default scaling KPA
+	if _, ok := annotations[autoscaling.ClassAnnotationKey]; !ok {
+		annotations[autoscaling.ClassAnnotationKey] = autoscaling.KPA
+	}
+
+	if componentExtension.ScaleTarget != nil {
+		annotations[autoscaling.TargetAnnotationKey] = fmt.Sprint(*componentExtension.ScaleTarget)
+	}
+
+	if componentExtension.ScaleMetric != nil {
+		annotations[autoscaling.MetricAnnotationKey] = fmt.Sprint(*componentExtension.ScaleMetric)
+	}
+
+	// Retrive the allow-zero-initial-scale and initial-scale values from the config-autoscaler configmap.
+	// If their respective keys, are not found in the configmap, use the knative default values.
+	allowZeroInitialScale := "false"
+	globalInitialScale := "1"
+	autoscalerConfig := &corev1.ConfigMap{}
+	err := client.Get(context.TODO(), types.NamespacedName{Name: "config-autoscaler", Namespace: "knative-serving"}, autoscalerConfig)
+	if err != nil {
+		log.Error(err, "failed to retrieve config-autoscaler configmap from the knative-serving namespace during knative service creation.")
+		return err
+	}
+	if autoscalerConfig.Data != nil {
+		if configuredAllowZeroInitialScale, ok := autoscalerConfig.Data["allow-zero-initial-scale"]; ok {
+			allowZeroInitialScale = configuredAllowZeroInitialScale
+		}
+		if configuredInitialScale, ok := autoscalerConfig.Data["initial-scale"]; ok {
+			globalInitialScale = configuredInitialScale
+		}
+	}
+
+	initialScaleInt, err := strconv.Atoi(globalInitialScale)
+	if err != nil {
+		log.Error(err, "failed to convert configured knative global initial-scale value to an integer", "initial-scale", globalInitialScale)
+		return err
+	}
+
+	// Provide transparency to users while aligning with knatives expected behaviour, log a warning when the knative global
+	// initial-scale value exceeds the requested minScale value for the ISVC.
+	if initialScaleInt > revisionMinScale {
+		log.Info("WARNING: knative is globally configured with an initial-scale value that is greater than the requested min-scale for the ISVC",
+			"initial-scale", initialScaleInt,
+			"min-scale", revisionMinScale)
+	}
+
+	// knative will choose the larger of min-scale and initial-scale as the initial target scale for a knative Revision.
+	// When min-scale is 0, if allow-zeron-initial scale is true, set initial-scale to 0 for the created knative revision.
+	// This will prevent any pods from being created to initialize a knative revision when an ISVC has minReplicas set to 0.
+	// Configuring scaling for knative: https://knative.dev/docs/serving/autoscaling/scale-bounds/#initial-scale
+	if revisionMinScale == 0 {
+		if allowZeroInitialScale == "true" {
+			log.Info("kserve will override the global knative configuration for initial-scale on a per revision basis when an ISVC is requested with min-scale 0",
+				"revision-intitial-scale", "0",
+				"global-initial-scale", globalInitialScale)
+			annotations[constants.InitialScaleAnnotationKey] = "0"
+		} else {
+			log.Info("WARNING: The current knative global configuration does not allow zero initial scale.",
+				"allow-zero-initial-scale", allowZeroInitialScale,
+				"initial-scale", globalInitialScale)
+		}
+	} else if componentExtension.MaxReplicas != 0 && initialScaleInt > componentExtension.MaxReplicas {
+		log.Info("WARNING: knative is globally configured with an initial-scale value that is greater than the requested max-scale for the ISVC",
+			"initial-scale", initialScaleInt,
+			"max-scale", componentExtension.MaxReplicas)
+		log.Info("setting initial-scale to the same value as max-scale for the requested ISVC",
+			"initial-scale", componentExtension.MaxReplicas)
+		annotations[constants.InitialScaleAnnotationKey] = fmt.Sprint(componentExtension.MaxReplicas)
+	}
+
+	return nil
 }
