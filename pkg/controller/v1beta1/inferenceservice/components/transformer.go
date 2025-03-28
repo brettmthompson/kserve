@@ -84,6 +84,9 @@ func (p *Transformer) Reconcile(isvc *v1beta1.InferenceService) (ctrl.Result, er
 			return !utils.Includes(p.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
 		})
 	}
+	annotations = utils.Filter(isvc.Annotations, func(key string) bool {
+		return !utils.Includes(p.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
+	})
 	// KNative does not support INIT containers or mounting, so we add annotations that trigger the
 	// StorageInitializer injector to mutate the underlying deployment to provision model data
 	if sourceURI := transformer.GetStorageUri(); sourceURI != nil {
@@ -129,6 +132,9 @@ func (p *Transformer) Reconcile(isvc *v1beta1.InferenceService) (ctrl.Result, er
 			return !utils.Includes(p.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
 		})
 	}
+	transformerAnnotations = utils.Filter(isvc.Spec.Transformer.Annotations, func(key string) bool {
+		return !utils.Includes(p.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
+	})
 
 	// Labels and annotations priority: transformer component > isvc
 	// Labels and annotations from high priority will overwrite that from low priority

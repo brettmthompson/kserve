@@ -84,6 +84,9 @@ func (e *Explainer) Reconcile(isvc *v1beta1.InferenceService) (ctrl.Result, erro
 		})
 	}
 
+	annotations = utils.Filter(isvc.Annotations, func(key string) bool {
+		return !utils.Includes(e.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
+	})
 	// KNative does not support INIT containers or mounting, so we add annotations that trigger the
 	// StorageInitializer injector to mutate the underlying deployment to provision model data
 	if sourceURI := explainer.GetStorageUri(); sourceURI != nil {
@@ -128,6 +131,9 @@ func (e *Explainer) Reconcile(isvc *v1beta1.InferenceService) (ctrl.Result, erro
 			return !utils.Includes(e.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
 		})
 	}
+	explainerAnnotations = utils.Filter(isvc.Spec.Explainer.Annotations, func(key string) bool {
+		return !utils.Includes(e.inferenceServiceConfig.ServiceAnnotationDisallowedList, key)
+	})
 
 	// Labels and annotations priority: explainer component > isvc
 	// Labels and annotations from high priority will overwrite that from low priority

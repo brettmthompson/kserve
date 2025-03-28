@@ -158,7 +158,7 @@ func TestNewServiceConfig(t *testing.T) {
 	nv, err := NewServiceConfig(noValue)
 	g.Expect(err).Should(gomega.BeNil())
 	g.Expect(nv).ShouldNot(gomega.BeNil())
-	g.Expect(nv.ServiceClusterIPNone).Should(gomega.BeTrue()) // In ODH the default is <true>
+	g.Expect(nv.ServiceClusterIPNone).Should(gomega.BeFalse())
 }
 
 func TestInferenceServiceDisallowedLists(t *testing.T) {
