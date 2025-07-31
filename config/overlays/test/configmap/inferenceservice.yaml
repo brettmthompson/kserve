@@ -22,7 +22,7 @@ data:
         "cpuModelcar": "10m",
         "memoryModelcar": "15Mi",
         "enableModelcar": true,
-        "uidModelcar": 1010
+        "uidModelcar": 1000920000
     }
   credentials: |-
     {
