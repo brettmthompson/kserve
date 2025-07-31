@@ -135,7 +135,8 @@ func InferenceServiceCfgMap(ns string) *corev1.ConfigMap {
 				"cpuLimit": "1",
 				"cpuModelcar": "10m",
 				"memoryModelcar": "15Mi",
-				"enableModelcar": true
+				"enableModelcar": true,
+				"uidModelcar": 1000920000
 			}`,
 	}
 	configMap := &corev1.ConfigMap{

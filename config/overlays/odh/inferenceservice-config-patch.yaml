@@ -23,7 +23,8 @@ data:
         "enableDirectPvcVolumeMount": true,
         "cpuModelcar": "10m",
         "memoryModelcar": "15Mi",
-        "enableModelcar": true
+        "enableModelcar": true,
+        "uidModelcar": 1000920000
     }
   ingress: |-
     {
