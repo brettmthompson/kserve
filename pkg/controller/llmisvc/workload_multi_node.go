@@ -169,6 +169,11 @@ func (r *LLMInferenceServiceReconciler) expectedMainMultiNodeLWS(ctx context.Con
 		},
 	}
 
+	serviceAccount, err := r.expectedMultiNodeMainServiceAccount(ctx, llmSvc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create expected multi node service account: %w", err)
+	}
+
 	if llmSvc.Spec.Template != nil {
 		expected.Spec.LeaderWorkerTemplate.LeaderTemplate = &corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
@@ -177,11 +182,12 @@ func (r *LLMInferenceServiceReconciler) expectedMainMultiNodeLWS(ctx context.Con
 			Spec: *llmSvc.Spec.Template.DeepCopy(),
 		}
 
-		serviceAccount, err := r.expectedMultiNodeMainServiceAccount(ctx, llmSvc)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create expected multi node service account: %w", err)
+		if llmSvc.Spec.Worker != nil {
+			expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = serviceAccount.GetName()
+		} else if expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName == serviceAccount.GetName() {
+			// Remove the managed service account from the spec if present after deletion
+			expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = ""
 		}
-		expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = serviceAccount.GetName()
 
 		if err := r.attachModelArtifacts(ctx, llmSvc, &expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec, storageConfig, credentialConfig); err != nil {
 			return nil, fmt.Errorf("failed to attach model artifacts to leader template: %w", err)
@@ -202,10 +208,6 @@ func (r *LLMInferenceServiceReconciler) expectedMainMultiNodeLWS(ctx context.Con
 	if llmSvc.Spec.Worker != nil {
 		expected.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec = *llmSvc.Spec.Worker.DeepCopy()
 
-		serviceAccount, err := r.expectedMultiNodeMainServiceAccount(ctx, llmSvc)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create expected multi node service account: %w", err)
-		}
 		expected.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.ServiceAccountName = serviceAccount.GetName()
 
 		if err := r.attachModelArtifacts(ctx, llmSvc, &expected.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec, storageConfig, credentialConfig); err != nil {
@@ -292,7 +294,13 @@ func (r *LLMInferenceServiceReconciler) expectedPrefillMultiNodeLWS(ctx context.
 				},
 				Spec: *llmSvc.Spec.Prefill.Template.DeepCopy(),
 			}
-			expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = serviceAccount.GetName()
+
+			if llmSvc.Spec.Prefill.Worker != nil {
+				expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = serviceAccount.GetName()
+			} else if expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName == serviceAccount.GetName() {
+				// Remove the managed service account from the spec if present after deletion
+				expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.ServiceAccountName = ""
+			}
 
 			if err := r.attachModelArtifacts(ctx, llmSvc, &expected.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec, storageConfig, credentialConfig); err != nil {
 				return nil, fmt.Errorf("failed to attach model artifacts to prefill leader template: %w", err)
@@ -404,7 +412,7 @@ func (r *LLMInferenceServiceReconciler) expectedMultiNodeMainServiceAccount(ctx 
 		},
 	}
 
-	// An existing service account attached to the main leader template takes precedence over any attached to the prefill worker template.
+	// An existing service account attached to the main leader template takes precedence over any attached to the main worker template.
 	var existingServiceAccountName string
 	if llmSvc.Spec.Template != nil && llmSvc.Spec.Template.ServiceAccountName != "" {
 		existingServiceAccountName = llmSvc.Spec.Template.ServiceAccountName

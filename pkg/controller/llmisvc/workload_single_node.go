@@ -104,13 +104,14 @@ func (r *LLMInferenceServiceReconciler) expectedSingleNodeMainDeployment(ctx con
 
 	if llmSvc.Spec.Template != nil {
 		d.Spec.Template.Spec = *llmSvc.Spec.Template.DeepCopy()
+
+		serviceAccount, err := r.expectedSingleNodeMainServiceAccount(ctx, llmSvc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to created expected single node service account: %w", err)
+		}
+
 		if hasRoutingSidecar(d.Spec.Template.Spec) {
 			log.FromContext(ctx).Info("Main container has a routing sidecar")
-
-			serviceAccount, err := r.expectedSingleNodeMainServiceAccount(ctx, llmSvc)
-			if err != nil {
-				return nil, fmt.Errorf("failed to created expected single node service account: %w", err)
-			}
 			d.Spec.Template.Spec.ServiceAccountName = serviceAccount.GetName()
 			s := routingSidecar(&d.Spec.Template.Spec)
 			if llmSvc.Spec.Router != nil {
@@ -120,6 +121,9 @@ func (r *LLMInferenceServiceReconciler) expectedSingleNodeMainDeployment(ctx con
 					ValueFrom: nil,
 				})
 			}
+		} else if d.Spec.Template.Spec.ServiceAccountName == serviceAccount.GetName() {
+			// Remove the managed service account from the spec if present after deletion
+			d.Spec.Template.Spec.ServiceAccountName = ""
 		}
 
 		if err := r.attachModelArtifacts(ctx, llmSvc, &d.Spec.Template.Spec, storageConfig, credentialConfig); err != nil {
